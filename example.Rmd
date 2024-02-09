@@ -1,0 +1,487 @@
+---
+title: "Example of (semi-)automatic anti-churn measures for longitudinal formr surveys"
+author: "Bernhard Piskernik"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+# Starting Point
+
+We conduct a longitudinal survey with [formr](https://formr.org/).
+
+It starts with a _initial survey_ that, among other information, asks for the participants' email addresses.
+Thereafter, a weekly survey for several weeks follows.
+
+To avoid drop-out while keeping work to a minimum we try to automate a anti-churn measure (reminder email to participants beginning to churn).
+
+To be precise, we try to identify all participants, that have not participated in the last two weeks (not less, not more) and automatically send them an automatic reminder-email. If this condition was triggered more than once, participants get a different reminder.
+
+# Preparations
+
+Install [formr](https://rubenarslan.github.io/formr/index.html)-package
+
+```{r}
+## uncomment below to install library
+
+# install.packages("devtools")
+# devtools::install_github("rubenarslan/formr")
+```
+
+
+Load libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(dotenv)
+
+library(formr)
+
+library(kableExtra)
+
+# for automatic contact
+library(blastula)
+library(Microsoft365R)
+
+```
+
+
+Load strings I don't want to publicly share from file _.env_
+
+```{r}
+load_dot_env(file = ".env")
+
+# login 
+email <- Sys.getenv("FORMR_EMAIL")
+password <- Sys.getenv("FORMR_PWD")
+
+# survey names
+survey_start <- Sys.getenv("SURVEY_START")
+survey_weekly <- Sys.getenv("SURVEY_WEEKLY")
+
+# field name of participant email in survey_start
+surve_email_field <- Sys.getenv("EMAIL_FIELD")
+
+# address used to send reminder email to participants
+email_sender <- Sys.getenv("EMAIL_SENDER")
+```
+
+
+# Get data
+
+Connect to formr
+
+```{r}
+formr_connect(
+  email = email,
+  password = password
+)
+```
+
+Retrieve data
+
+```{r}
+df_start_raw <- formr_raw_results(survey_start)
+df_weekly_raw <- formr_raw_results(survey_weekly)
+```
+
+Disconnect from
+
+```{r}
+formr_disconnect()
+```
+
+
+# Slice and dice data
+
+##  Emails
+
+Get email and session from `df_start_raw`
+
+```{r}
+df_email <- df_start_raw %>%
+  select(all_of(c('session', surve_email_field))) %>%
+  drop_na() %>%
+  rename(
+    'email' = surve_email_field
+  )
+```
+
+I replace the original emails with random fake ones. Don't copy this chunk in your project!
+
+```{r}
+df_email <- df_email %>%
+  mutate(email = generator::r_email_addresses(dim(.)[1]))
+```
+
+
+## Weekly
+
+### Extract and limit to needed data
+
+* session
+* week (our survey week starts at Thursday, so we need to shift the timestamp a little)
+* answered survey (or to be more precise did not let the survey expire)
+
+```{r}
+# survey week starts at thu 17:00 and ends on wed
+# shift `created` to allow use of iso_week
+# use_time = created - 3 days & 9 hours (-> thu 15:00 - start early to have safety margin, survey week is shorter than 7 full days)
+
+survey_week_shift <- duration(hour = 9, day = 3)
+
+df_weekly <- df_weekly_raw %>%
+  mutate(
+    created = ymd_hms(created) # convert to timestamp
+    , week = year(created-survey_week_shift)*100 + isoweek(created-survey_week_shift)
+    , answered = is.na(expired) 
+  ) %>%
+  arrange(session, week) %>%
+  # aggregate by week (there are reminders, but one answered is sufficient)
+  group_by(
+    session
+    , week
+  ) %>%
+  summarize(
+    active = max(answered)
+  ) %>%
+  # not all participants start simultaniously - align to their individual starting dates
+  mutate(
+    week_individual = row_number()
+  )
+```
+
+### Derive all data we need
+
+Get number of weeks participants are currently inactive
+
+```{r}
+df_currently_inactive_weeks <- df_weekly %>%
+  group_by(
+    session
+  ) %>%
+  mutate(
+    d = abs(active-lag(active)) %>% replace_na(0)
+    , streak = cumsum(d)
+  ) %>%
+  group_by(
+    session
+    , streak
+  ) %>%
+  mutate(
+    streak_duration = row_number()
+  ) %>%
+  ungroup() %>%
+  group_by(
+    session
+  ) %>%
+  slice_tail() %>%
+  mutate(
+    currently_inactive_weeks = ifelse(active == 1, 0, streak_duration)
+  ) %>%
+  select(session, currently_inactive_weeks)
+```
+
+Get count of inactive streaks (at least 2 weeks no response) per participant
+
+```{r, message=FALSE}
+df_severe <- df_weekly %>%
+  group_by(
+    session
+  ) %>%
+  mutate(
+    d = abs(active-lag(active)) %>% replace_na(0)
+    , streak = cumsum(d)
+  ) %>%
+  group_by(
+    session
+    , streak
+  ) %>%
+  mutate(
+    streak_duration = row_number()
+  ) %>%
+  ungroup() %>%
+  filter(
+    (streak %% 2 == 1) | ((streak == 0) & (active==0))  # = # inactive
+    , streak_duration == 2
+  ) %>%
+  group_by(session) %>%
+  summarize(
+    inactive_streaks = n()
+  )  %>%
+  right_join(
+    df_weekly %>%
+      select(session) %>%
+      distinct()
+  ) %>%
+  mutate(
+    inactive_streaks = replace_na(inactive_streaks, 0)
+  )%>%
+  mutate(
+    severe = inactive_streaks >= 2
+  )
+```
+
+Get total participation duration per participant
+
+```{r}
+df_participation <- df_weekly %>%
+  group_by(session) %>%
+  summarize(duration = max(week_individual)) %>%
+  arrange(desc(duration), session)
+```
+
+
+## Put everything together into a table of the status quo
+
+```{r, message=FALSE}
+df_status <- df_participation %>%
+  inner_join(df_email) %>%
+  inner_join(df_currently_inactive_weeks) %>%
+  mutate(
+    remind = currently_inactive_weeks == 2
+  ) %>%
+  inner_join(df_severe) %>%
+  inner_join(
+    df_weekly %>%
+      pivot_wider(
+        id_cols = session
+        , names_from = week_individual
+        , values_from = active
+      )
+  ) %>%
+  select(-c('session', 'duration', 'currently_inactive_weeks', 'inactive_streaks'))
+```
+
+
+# Display results
+
+If using RStudio dark theme, kableExtra output is not legible, therefore we need to override its print function.
+
+```{r, eval=FALSE}
+# taken from stackoverflow, but have forgotten all details
+
+print.kableExtra <- function (x, ...) {
+  view_html <- getOption("kableExtra_view_html", TRUE)
+  if (view_html & interactive()) {
+    dep <- list(
+      rmarkdown::html_dependency_jquery(), 
+      rmarkdown::html_dependency_bootstrap(theme = "cosmo"), 
+      kableExtra::html_dependency_kePrint(), 
+      kableExtra::html_dependency_lightable()
+    )
+    
+    x <- sub('style="', 'style="color: black; ', as.character(x), fixed = TRUE)
+        
+    html_kable <- htmltools::browsable(
+      htmltools::HTML(
+        as.character(x), 
+        "<script type=\"text/x-mathjax-config\">MathJax.Hub.Config({tex2jax: {inlineMath: [[\"$\",\"$\"]]}})</script><script async src=\"https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML\"></script>"
+      )
+    )
+    htmltools::htmlDependencies(html_kable) <- dep
+    class(html_kable) <- "shiny.tag.list"
+    print(html_kable)
+  }
+  else {
+    cat(as.character(x))
+  }
+}
+```
+
+Helper function to print a nice table
+
+```{r}
+to_status_table <- function(df){
+  df %>%
+  mutate(
+    remind = cell_spec(remind, background = ifelse(remind, 'darkred', 'seagreen'), color = 'white')
+    , severe = cell_spec(severe, background = ifelse(severe, 'darkred', 'seagreen'), color = 'white')
+  ) %>%
+  mutate_if(
+    is.numeric, 
+    ~cell_spec(
+      ., 
+      color = case_when(
+        is.na(.) ~ 'grey',
+        . == 1 ~ 'seagreen',
+        . == 0 ~ 'darkred'
+      )
+      , bold = !is.na(.))
+    ) %>%
+  kbl(escape = F) %>%
+  kable_paper(bootstrap_options = "striped", full_width = T, fixed_thead = T)
+}
+```
+
+Display status quo
+
+```{r}
+df_status %>%
+  to_status_table()
+```
+
+Show only those who will get an email
+
+```{r}
+df_contact <- df_status %>%
+  filter(remind)
+```
+
+
+```{r}
+df_contact %>%
+  to_status_table()
+```
+
+# Send emails
+
+## Get email credentials
+
+If you are working for a university chances are good that you have a MS outlook business account. To use those with R you need the [Microsoft365R](https://cran.r-project.org/web/packages/Microsoft365R/index.html)-library. If you want to send the emails from another account, then changes are good, that you can do it directly with [blastula](https://cran.r-project.org/web/packages/blastula/index.html).
+
+If you use  MS outlook business, you need to grant permission on the first execution. The following snippet will open outlook in the browser, requires you to log in and give your permission.
+
+```{r, eval=FALSE}
+outl <- get_business_outlook()
+```
+
+
+## Create email templates
+
+The following emails are very basic, both technically and regarding the content. In a real use-case be more creative in the wording, personalize (e.g., if you know the name of the participants - use it), add a logo from your university ... see [blastula](https://cran.r-project.org/web/packages/blastula/index.html) for the technical options.
+
+
+```{r}
+email_basic <-
+  compose_email(
+    body = md(
+      glue::glue(
+"
+Dear Participant,
+
+We hope this email finds you well. We're reaching out because we haven't seen your participation in our ongoing longitudinal study for a while now.
+
+We truly appreciate your initial commitment to this important research, and we value every contribution you've made so far. Your continued participation is crucial for us to gain valuable insights into life, the universe, and everything that exists.
+
+We understand that life gets busy, and things might come up that prevent you from completing tasks. If there's any reason you haven't been able to participate recently, please let us know! We're happy to answer any questions you may have, address any concerns, or work out a schedule that works better for you.
+
+Here are some ways you can get back involved:
+
+* **Complete any outstanding tasks**: If you have any pending surveys, please let us know and we'll gladly resend the access links.
+* **Let us know your availability**: If you're interested in continuing but need to adjust your participation schedule, please feel free to reply to this email with your preferences.
+* **Provide feedback**: If you've decided not to continue, we would still greatly appreciate your feedback on your experience with the study. Your insights will help us improve future research.
+Remember, every contribution matters! By continuing your participation, you're helping us answer important questions that could benefit not less than the whole human kind.
+
+Thank you for your time and consideration. We hope to hear from you soon!
+
+Sincerely,
+
+The Research Team
+"
+      )
+    )
+  )
+
+```
+
+
+```{r}
+email_severe <-
+  compose_email(
+    body = md(
+      glue::glue(
+"
+Dear Participant,
+
+We're reaching out because we haven't seen your participation in our ongoing longitudinal study for a while now, and your previous contributions have been irregular.
+
+We deeply appreciate your willingness to be part of this important research, and we want to ensure it's still a good fit for you. Understanding your needs helps us improve the study experience for everyone.
+
+Could you tell us a little more about:
+
+* What made you initially sign up for the study?
+* What have you enjoyed about participating so far?
+* Have you encountered any challenges that prevented you from participating regularly?
+
+Remember, there's no pressure to continue if the study no longer aligns with your time or interests. However, if there's anything we can do to make participation easier or more engaging, please don't hesitate to let us know.
+
+Here are some options:
+
+* **Adjust your participation schedule**: Tell us what frequency works best for you.
+*  **Share your feedback**: Even if you decide not to continue, sharing your experience helps us improve future research.
+
+Ultimately, we want to ensure this study stays valuable to both participants and our research goals. Thank you for your time and we look forward to hearing from you soon!
+
+Sincerely,
+The Research Team
+"
+      )
+    )
+  )
+
+```
+
+## Preview the emails
+
+Basic version
+
+```{r email_basic}
+email_basic
+```
+
+
+Severe version
+
+```{r email_severe}
+email_severe
+```
+
+## Send the emails
+
+Create a function to create the email for eachparticipant
+
+```{r, eval=FALSE}
+add_email <- function(email, severe) {
+  
+  # ifelse & case_when do not work for flow control due to output datatype
+  mail <- email_basic # default fallback
+  
+  if(severe) {
+      mail <- email_severe
+  }
+  
+
+  return(
+    outl$create_email(
+      mail
+      , subject="Checking in: Your continued participation matters in our study!"
+      , to=address
+      )
+    )
+}
+```
+
+Create the emails
+
+```{r, eval=FALSE}
+emails <- df_contact %>%
+  mutate(
+    em = pmap(list(email, severe), add_email)
+  ) %>%
+  pull(em)
+```
+
+Send the emails
+
+```{r, eval=FALSE}
+for(em in emails){
+  em$send()
+  Sys.sleep(5)
+}
+```
+
+
+
